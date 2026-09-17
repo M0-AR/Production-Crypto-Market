@@ -1,0 +1,57 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  static-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: frontend
+      - run: npm run lint && npm run typecheck && npm test
+        working-directory: frontend
+      - run: npm ci --no-audit --no-fund
+        working-directory: backend
+      - run: npx tsc --noEmit && npm test
+        working-directory: backend
+
+  stack-contract-and-spike:
+    runs-on: ubuntu-latest
+    needs: static-and-unit
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create dev secrets (CI-only values, never prod keys)
+        run: |
+          openssl rand -hex 32 > secrets/postgres_password.txt
+          openssl rand -hex 32 > secrets/jwt_secret.txt
+          openssl rand -hex 24 > secrets/redis_password.txt
+          echo -n "demo" > secrets/coingecko_key.txt
+          chmod 600 secrets/*.txt
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+      - name: Build + start (health-gated, no sleeps)
+        run: docker compose -f docker-compose.yml up -d --build --wait --wait-timeout 600
+      - name: Contract + spike gates (unit already proven above)
+        env:
+          BASE_URL: http://localhost
+          SKIP_UNIT: "1"
+        run: ./tests/run.sh
+      - name: Dump state on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml ps
+          docker compose -f docker-compose.yml logs --no-color --tail=150
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker-compose.yml down -v --remove-orphans

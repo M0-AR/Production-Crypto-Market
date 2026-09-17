@@ -1,0 +1,374 @@
+# pro-sellable — verified 2026 production stack
+# FE: Next.js 16 App Router + React 19 + Tailwind v4 + shadcn/ui pattern (RSC, zero runtime)
+# BE: NestJS 11 + Prisma + PostgreSQL 16 + Redis 7 + BullMQ (stateless, cache-aside, queue)
+# Infra: single compose base (prod-safe) + compose.override.yml (dev only) — runs on any cloud VPS.
+
+name: pro-sellable
+
+# Hardening anchors (verified 2026 checklist): non-root images + no-new-privileges +
+# least-privilege caps. Data images keep only the caps they need to drop to service users.
+x-sec-app: &sec-app
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+x-sec-data: &sec-data
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+x-sec-nginx: &sec-nginx
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  cap_add: [NET_BIND_SERVICE, CHOWN, SETUID, SETGID, DAC_OVERRIDE]
+
+services:
+  # ── Reverse proxy: single public entrypoint, TLS termination, rate-limit ──
+  nginx:
+    <<: *sec-nginx
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Frontend: Next.js standalone ──
+  frontend:
+    <<: *sec-app
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      # Browser talks to backend via nginx /api, never direct. Server components use internal name.
+      NEXT_PUBLIC_API_URL: /api
+      BACKEND_INTERNAL_URL: http://backend:4000
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Backend: NestJS stateless API ──
+  backend:
+    <<: *sec-app
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    stop_grace_period: 60s # match enableShutdownHooks drain budget
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      # Sandbox/VPS networks with broken IPv6: Node tries AAAA first and hangs
+      # instead of falling back (wget falls back, undici doesn't in time).
+      # ipv4first is the deterministic fix — verified live (ETIMEDOUT -> 200).
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-change-me-in-secrets}@postgres:5432/${POSTGRES_DB:-appdb}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost}
+      COINGECKO_API_KEY_FILE: /run/secrets/coingecko_key
+    secrets:
+      - jwt_secret
+      - coingecko_key
+      - redis_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    networks:
+      - backend
+      - data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:4000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Queue worker: same image, different command — scales independently from web ──
+  worker:
+    <<: *sec-app
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: runner
+    restart: unless-stopped
+    stop_grace_period: 60s # let active BullMQ jobs finish/nack before SIGKILL
+    command: ["node", "dist/queue-worker.js"]
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --dns-result-order=ipv4first
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-change-me-in-secrets}@postgres:5432/${POSTGRES_DB:-appdb}
+      REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    secrets:
+      - redis_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+      - data
+    # Worker serves no HTTP — image HEALTHCHECK (backend /api/health) does not apply here.
+    # Liveness = process + Redis connectivity, visible in logs + queue depth metrics.
+    healthcheck:
+      test: ["CMD-SHELL", "ps | grep -q '[q]ueue-worker'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ── Migrations: run-once job before backend starts ──
+  migrator:
+    <<: *sec-app
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder
+    command: ["sh", "-c", "npx prisma migrate deploy"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-change-me-in-secrets}@postgres:5432/${POSTGRES_DB:-appdb}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data
+    restart: "no"
+
+  # ── Postgres: primary (add read replicas only when reads dominate + CPU >60%) ──
+  postgres:
+    <<: *sec-data
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - data
+    # NOTE: no ports in prod base — access via backend only. Override opens 5432 locally.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-app} -d $${POSTGRES_DB:-appdb}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=1536MB"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "log_min_duration_statement=200"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ── Redis: sessions + cache-aside + BullMQ (3 jobs in 1 tech, per system-design video) ──
+  # Eviction MUST be noeviction: BullMQ correctness requires it (allkeys-lru silently drops jobs).
+  # Cache stays bounded anyway: every key is SETEX 60–90s with jitter (see CoinsService).
+  redis:
+    <<: *sec-data
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Password from secret FILE (verified pattern): never in env/inspect, never committed.
+    # $$ escapes compose interpolation -> evaluated inside the container.
+    command: >
+      sh -c 'redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+      --requirepass "$$(cat /run/secrets/redis_password)"'
+    secrets:
+      - redis_password
+    volumes:
+      - redis_data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$(cat /run/secrets/redis_password)\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Backups: pg_dump sidecar, daily + 7-day retention, push-monitor hook ──
+  # (verified pattern: sidecar + named volume + optional Uptime Kuma push ping.
+  #  A backup you never restored is a rumor: drill quarterly, see README.)
+  backup:
+    <<: *sec-data
+    image: postgres:16-alpine
+    restart: unless-stopped
+    command: >
+      sh -c 'export PGPASSWORD="$$(cat /run/secrets/postgres_password)";
+      mkdir -p /backups;
+      while true; do
+        f="/backups/appdb-$$(date +%F_%H%M).sql.gz";
+        if pg_dump -h postgres -U $${POSTGRES_USER:-app} -d $${POSTGRES_DB:-appdb} | gzip > "$$f"; then
+          echo "[backup] wrote $$f";
+          ls -t /backups/appdb-*.sql.gz | tail -n +8 | xargs -r rm -f;
+          [ -n "$${UPTIME_PUSH_URL:-}" ] && wget -qO- "$${UPTIME_PUSH_URL}?status=up&msg=backup-ok" > /dev/null || true;
+        else
+          echo "[backup] FAILED";
+          [ -n "$${UPTIME_PUSH_URL:-}" ] && wget -qO- "$${UPTIME_PUSH_URL}?status=down&msg=backup-failed" > /dev/null || true;
+        fi;
+        sleep $${BACKUP_INTERVAL_SECS:-86400};
+      done'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-appdb}
+      BACKUP_INTERVAL_SECS: ${BACKUP_INTERVAL_SECS:-86400}
+      UPTIME_PUSH_URL: ${UPTIME_PUSH_URL:-}
+    secrets:
+      - postgres_password
+    volumes:
+      - backups:/backups
+    networks:
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  frontend:
+    driver: bridge
+  backend:
+    driver: bridge
+  data:
+    driver: bridge
+    internal: true # DB + cache have no internet route — blast-radius containment
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backups:
+    driver: local
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt
+  redis_password:
+    file: ./secrets/redis_password.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+  coingecko_key:
+    file: ./secrets/coingecko_key.txt

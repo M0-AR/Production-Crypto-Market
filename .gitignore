@@ -1,0 +1,15 @@
+node_modules/
+.next/
+dist/
+build/
+coverage/
+.env
+!.env.example
+compose.local.yml
+secrets/*.txt
+!secrets/.gitkeep
+postgres_data/
+redis_data/
+*.log
+.DS_Store
+*.tsbuildinfo
