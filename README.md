@@ -299,10 +299,10 @@ CI (`.github/workflows/ci.yml`): static+unit → build → `up --wait` (no sleep
 
 Do these in the GitHub UI right after pushing (voted consensus from 2026 open-source guides):
 
-- [ ] Secrets audit: `secrets/*.txt` and `.env` are gitignored — confirm `git log` never contained real keys (if it did, rotate them; history rewrites don't reach forks/caches).
+- [x] Secrets audit: `secrets/*.txt` and `.env` are gitignored — first (and only) commit contains zero secrets (verified via staged-file review + secret-value grep).
 - [ ] About (⚙️): description = one-liner above, website = demo URL, topics = `nextjs`, `nestjs`, `docker-compose`, `crypto`, `tailwindcss`, `bullmq`.
 - [ ] Social preview: upload `docs/assets/social-preview.png` (Settings → Social preview, 1280×640).
-- [ ] Uncomment the CI/Stars/Star-History badges at the top with your real `USER/REPO`.
+- [x] CI/Stars/Star-History badges enabled with real `M0-AR/Production-Crypto-Market` (CI runs on every push/PR).
 - [ ] Branch protection on `main`: no force pushes, require `ci` status checks.
 - [ ] Enable secret scanning + push protection; Dependabot for `github-actions` + npm.
 - [ ] `git tag v1.0.0 && git push origin v1.0.0` (semver; releases ride CI).
