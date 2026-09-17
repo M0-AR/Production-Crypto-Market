@@ -9,7 +9,10 @@
 [![NestJS 11](https://img.shields.io/badge/NestJS-11-E0234E?logo=nestjs)](backend/package.json)
 
 <!-- After going public, replace YOUR_USER/YOUR_REPO and uncomment: -->
+<!-- CI badge parked: GitHub Actions isn't available on this account right now.
+     Re-add when ready:
 [![CI](https://github.com/M0-AR/Production-Crypto-Market/actions/workflows/ci.yml/badge.svg)](https://github.com/M0-AR/Production-Crypto-Market/actions)
+     Local gate stays green via ./tests/run.sh (38/38). -->
 [![Stars](https://img.shields.io/github/stars/M0-AR/Production-Crypto-Market?style=social)](https://github.com/M0-AR/Production-Crypto-Market)
 [![Star History](https://api.star-history.com/svg?repos=M0-AR/Production-Crypto-Market&type=Date)](https://star-history.com/#M0-AR/Production-Crypto-Market&Date)
 
